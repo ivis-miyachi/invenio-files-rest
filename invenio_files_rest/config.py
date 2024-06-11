@@ -8,9 +8,10 @@
 
 """Invenio Files Rest module configuration file."""
 
+import tempfile
 from datetime import timedelta
 
-MAX_CONTENT_LENGTH = 16 * 1024 * 1024
+MAX_CONTENT_LENGTH = 64424509440 
 """Maximum allowed content length for form data.
 
 This value limits the maximum file upload size via multipart-formdata and is
@@ -93,6 +94,7 @@ FILES_REST_UPLOAD_FACTORIES = [
 ]
 """Import path of factory used to parse file uploads.
 
+
 .. note::
 
    Factories that reads ``request.stream`` directly must be first in the list,
@@ -117,5 +119,24 @@ FILES_REST_TASK_WAIT_INTERVAL = 2
 FILES_REST_TASK_WAIT_MAX_SECONDS = 600
 """Maximum number of seconds to wait for a task to finish."""
 
+FILES_REST_LOCATION_TYPE_LIST = [('s3', 'Amazon S3')]
+"""Location type list"""
+
+FILES_REST_UPLOAD_OWNER_FACTORIES = 'invenio_files_rest.serializer.file_uploaded_owner'
+"""file update version"""
+
+FILES_REST_DEFAULT_PDF_SAVE_PATH = tempfile.gettempdir()
+"""convert pdf save path"""
+
+FILES_REST_DEFAULT_PDF_TTL = 1 * 60 * 60  # 1 hour
+"""convert pdf ttl"""
+
 FILES_REST_FILE_TAGS_HEADER = 'X-Invenio-File-Tags'
 """Header for updating file tags."""
+
+FILES_REST_ROLES_ENV = [
+    'INVENIO_ROLE_SYSTEM',
+    'INVENIO_ROLE_REPOSITORY',
+    'INVENIO_ROLE_COMMUNITY'
+]
+"""The version update roles."""

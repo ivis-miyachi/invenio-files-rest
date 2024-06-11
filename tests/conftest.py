@@ -13,10 +13,9 @@ from __future__ import absolute_import, print_function
 
 import hashlib
 import os
+import pytest
 import shutil
 import tempfile
-
-import pytest
 from flask import Flask, json, url_for
 from flask_babelex import Babel
 from flask_celeryext import FlaskCeleryExt
@@ -33,7 +32,7 @@ from six import BytesIO
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.schema import DropConstraint, DropSequence, DropTable
 from sqlalchemy_utils.functions import create_database, database_exists
-
+from invenio_previewer import InvenioPreviewer
 from invenio_files_rest import InvenioFilesREST
 from invenio_files_rest.models import Bucket, Location, MultipartObject, \
     ObjectVersion, Part
@@ -74,9 +73,10 @@ def base_app():
         CELERY_TASK_ALWAYS_EAGER=True,
         CELERY_TASK_EAGER_PROPAGATES=True,
         SQLALCHEMY_TRACK_MODIFICATIONS=True,
-        SQLALCHEMY_DATABASE_URI=os.environ.get(
-            'SQLALCHEMY_DATABASE_URI',
-            'sqlite:///:memory:'),
+        # SQLALCHEMY_DATABASE_URI=os.environ.get(
+        #     'SQLALCHEMY_DATABASE_URI',
+        #     'sqlite:///:memory:'),
+        SQLALCHEMY_DATABASE_URI='postgresql+psycopg2://invenio:dbpass123@postgresql:5432/wekotest',        
         WTF_CSRF_ENABLED=False,
         SERVER_NAME='invenio.org',
         SECURITY_PASSWORD_SALT='TEST_SECURITY_PASSWORD_SALT',
@@ -92,6 +92,7 @@ def base_app():
     InvenioDB(app_)
     Babel(app_)
     Menu(app_)
+    InvenioPreviewer(app_)
 
     return app_
 
@@ -143,6 +144,23 @@ def dummy_location(db):
 
     yield loc
 
+    shutil.rmtree(tmppath)
+
+@pytest.yield_fixture()
+def dummy_s3_location(db):
+    tmppath = tempfile.mkdtemp()
+    loc = Location(
+        name="s3",
+        uri=tmppath,
+        access_key="test_access_key",
+        secret_key="test_secret_key",
+        s3_endpoint_url="http://test.s3.com",
+        s3_send_file_directly=True
+    )
+    db.session.add(loc)
+    db.session.commit()
+    yield loc
+    
     shutil.rmtree(tmppath)
 
 
@@ -391,6 +409,16 @@ def get_md5():
         m = hashlib.md5()
         m.update(data)
         return "md5:{0}".format(m.hexdigest()) if prefix else m.hexdigest()
+    return inner
+
+
+@pytest.fixture()
+def get_sha256():
+    """Get sha256 of data."""
+    def inner(data, prefix=True):
+        m = hashlib.sha256()
+        m.update(data)
+        return "sha256:{0}".format(m.hexdigest()) if prefix else m.hexdigest()
     return inner
 
 

@@ -36,7 +36,9 @@ model.
 
 from __future__ import absolute_import, print_function
 
+import shutil
 import mimetypes
+import os
 import re
 import sys
 import uuid
@@ -45,13 +47,18 @@ from functools import wraps
 from os.path import basename
 
 import six
-from flask import current_app
+import sqlalchemy as sa
+from flask import current_app, flash, redirect, request, url_for
+from flask_login import current_user
 from invenio_db import db
-from sqlalchemy.dialects import mysql
+from invenio_previewer.api import convert_to
+from sqlalchemy.dialects import mysql, postgresql
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import validates
 from sqlalchemy.orm.exc import MultipleResultsFound
-from sqlalchemy_utils.types import UUIDType
+from sqlalchemy.sql.expression import func
+from sqlalchemy_utils.types import JSONType, UUIDType
+from weko_admin.models import AdminSettings
 
 from .errors import BucketLockedError, FileInstanceAlreadySetError, \
     FileInstanceUnreadableError, FileSizeError, InvalidKeyError, \
@@ -59,7 +66,6 @@ from .errors import BucketLockedError, FileInstanceAlreadySetError, \
     MultipartInvalidChunkSize, MultipartInvalidPartNumber, \
     MultipartInvalidSize, MultipartMissingParts, MultipartNotCompleted
 from .proxies import current_files_rest
-from .utils import ENCODING_MIMETYPES, guess_mimetype
 
 slug_pattern = re.compile('^[a-z][a-z0-9-]+$')
 
@@ -130,6 +136,7 @@ def update_bucket_size(f):
     def inner(self, *args, **kwargs):
         res = f(self, *args, **kwargs)
         self.bucket.size += self.file.size
+        # self.bucket.location.size += self.file.size
         return res
     return inner
 
@@ -145,6 +152,7 @@ def ensure_state(default_getter, exc_class, default_msg=None):
                 return f(self, *args, **kwargs)
             return inner
         return ensure_decorator
+
     return decorator
 
 
@@ -273,6 +281,22 @@ class Location(db.Model, Timestamp):
 
     At least one location should be the default location.
     """
+
+    type = db.Column(db.String(20), nullable=True)
+
+    access_key = db.Column(db.String(128), nullable=True)
+
+    secret_key = db.Column(db.String(128), nullable=True)
+
+    s3_endpoint_url = db.Column(db.String(128), nullable=True)
+
+    s3_send_file_directly = db.Column(db.Boolean(name='s3_send_file_directly'), nullable=False, default=True)
+    
+    size = db.Column(db.BigInteger, default=0, nullable=True)
+
+    quota_size = db.Column(db.BigInteger, nullable=True)
+
+    max_file_size = db.Column(db.BigInteger, nullable=True)
 
     @validates('name')
     def validate_name(self, key, name):
@@ -431,7 +455,7 @@ class Bucket(db.Model, Timestamp):
             db.session.add(bucket)
 
         for o in ObjectVersion.get_by_bucket(self):
-            o.copy(bucket=bucket)
+            o.copy(bucket=bucket, is_thumbnail=o.is_thumbnail)
 
         bucket.locked = True if lock else self.locked
 
@@ -692,6 +716,21 @@ class FileInstance(db.Model, Timestamp):
     last_check = db.Column(db.Boolean(name='last_check'), default=True)
     """Result of last fixity check."""
 
+    json = db.Column(
+        db.JSON().with_variant(
+            postgresql.JSONB(none_as_null=True),
+            'postgresql',
+        ).with_variant(
+            JSONType(),
+            'sqlite',
+        ).with_variant(
+            JSONType(),
+            'mysql',
+        ),
+        default=lambda: dict(),
+        nullable=True
+    )
+
     @validates('uri')
     def validate_uri(self, key, uri):
         """Validate uri."""
@@ -710,6 +749,14 @@ class FileInstance(db.Model, Timestamp):
         """Get a file instance by URI."""
         assert uri is not None
         return cls.query.filter_by(uri=uri).one_or_none()
+
+    @classmethod
+    def get_location_by_file_instance(cls):
+        """Get a file instance by URI."""
+        return db.session.query(Location).filter(
+            FileInstance.uri.like(Location.uri + "%")) \
+            .filter(FileInstance.id == cls.id) \
+            .first()
 
     @classmethod
     def create(cls):
@@ -738,6 +785,8 @@ class FileInstance(db.Model, Timestamp):
            Normally you should use the Celery task to delete a file instance,
            as this method will not remove the file on disk.
         """
+        location = self.get_location_by_file_instance()
+        location.size = location.size - self.size
         self.query.filter_by(id=self.id).delete()
         return self
 
@@ -817,38 +866,96 @@ class FileInstance(db.Model, Timestamp):
 
     @ensure_writable()
     def set_contents(self, stream, chunk_size=None, size=None, size_limit=None,
-                     progress_callback=None, **kwargs):
+                     progress_callback=None, is_set_size_location=True,
+                     **kwargs):
         """Save contents of stream to this file.
 
         :param obj: ObjectVersion instance from where this file is accessed
             from.
         :param stream: File-like stream.
         """
+        old_size = self.size if self.size else 0
         self.set_uri(
             *self.storage(**kwargs).save(
                 stream, chunk_size=chunk_size, size=size,
                 size_limit=size_limit, progress_callback=progress_callback))
+        if is_set_size_location:
+            location = self.get_location_by_file_instance()
+            location.size = location.size + self.size - old_size
 
     @ensure_writable()
     def copy_contents(self, fileinstance, progress_callback=None,
                       chunk_size=None, **kwargs):
         """Copy this file instance into another file instance."""
+        def copy(storage, src, chunk_size=None, progress_callback=None):
+            fp = src.open(mode='rb')
+            try:
+                return storage.save(fp, chunk_size=chunk_size,
+                                    progress_callback=progress_callback)
+            finally:
+                fp.close()
+
         if not fileinstance.readable:
             raise ValueError('Source file instance is not readable.')
         if not self.size == 0:
             raise ValueError('File instance has data.')
 
-        self.set_uri(
-            *self.storage(**kwargs).copy(
-                fileinstance.storage(**kwargs),
-                chunk_size=chunk_size,
-                progress_callback=progress_callback))
+        storage = self.storage(**kwargs)
+        fileinstance_storage = fileinstance.storage(**kwargs)
+        copy_result = copy(storage, fileinstance_storage, chunk_size=chunk_size,
+                           progress_callback=progress_callback)
+        self.set_uri(*copy_result)
 
     @ensure_readable()
     def send_file(self, filename, restricted=True, mimetype=None,
                   trusted=False, chunk_size=None, as_attachment=False,
-                  **kwargs):
+                  convert_to_pdf=False, **kwargs):
         """Send file to client."""
+        # Convert ms office file to PDF for preview
+        if convert_to_pdf:
+
+            try:
+                settings = AdminSettings.get('convert_pdf_settings')
+
+                # Load settings from settings if there is not settings in db
+                if settings:
+                    path = settings.path
+                else:
+                    path = current_app.config['FILES_REST_DEFAULT_PDF_SAVE_PATH']
+
+                pdf_dir = path + '/pdf_dir/' + str(self.id)
+                pdf_filename = '/data.pdf'
+                file_type = os.path.splitext(self.json['filename'])[1].lower()
+                # Change preview file to pdf
+                self.json['mimetype'] = 'application/pdf'
+                self.json['filename'] = self.json['filename'].replace(
+                    file_type, '.pdf')
+
+                if not os.path.isfile(pdf_dir + pdf_filename):
+                    convert_dir = path+"/convert_"+str(self.id)
+                    target_uri = self.uri
+                    if self.uri.startswith("s3://"):
+                        target_uri = convert_dir+"/"+self.uri.split("/")[-1]
+                        if os.path.exists(convert_dir):
+                            shutil.rmtree(convert_dir)
+                        os.makedirs(convert_dir)
+                        fp = self.storage(**kwargs).open(mode='rb')
+                        data = fp.read()
+                        fp.close()
+                        with open(target_uri,"wb") as f:
+                            f.write(data)
+
+                    convert_to(pdf_dir, target_uri)
+
+                    if os.path.exists(convert_dir):
+                        shutil.rmtree(convert_dir)
+
+                self.uri = pdf_dir + pdf_filename
+                self.size = os.path.getsize(pdf_dir + pdf_filename)
+            except Exception as ex:
+                current_app.logger.error('convert to pdf error')
+                current_app.logger.error(ex)
+
         return self.storage(**kwargs).send_file(
             filename,
             mimetype=mimetype,
@@ -872,6 +979,30 @@ class FileInstance(db.Model, Timestamp):
             if storage_class is None else \
             storage_class
         return self
+
+    def update_json(self, jsn):
+        """Update file metadata.
+
+        :param jsn: Dictionary of file metadata.
+        :return:
+        """
+        self.json = jsn.copy()
+
+    def upload_file(self, fjson, **kwargs):
+        """Put file to Elasticsearch.
+
+        :param fjson:
+        :param kwargs:
+        """
+        self.storage(**kwargs).upload_file(fjson)
+
+    def read_file(self, fjson, **kwargs):
+        """Put file to Elasticsearch.
+
+        :param fjson:
+        :param kwargs:
+        """
+        return self.storage(**kwargs).read_file(fjson)
 
 
 class ObjectVersion(db.Model, Timestamp):
@@ -923,6 +1054,9 @@ class ObjectVersion(db.Model, Timestamp):
     A null value in this column defines that the object has been deleted.
     """
 
+    root_file_id = db.Column(UUIDType, nullable=True)
+    """File id in the first time for this object version."""
+
     _mimetype = db.Column(
         db.String(255),
         index=True,
@@ -934,12 +1068,27 @@ class ObjectVersion(db.Model, Timestamp):
                         default=True)
     """Defines if object is the latest version."""
 
+    created_user_id = db.Column(db.Integer, nullable=True, default=0)
+    """created user id of uploading."""
+
+    updated_user_id = db.Column(db.Integer, nullable=True, default=0)
+    """updated user id of uploading."""
+
     # Relationships definitions
     bucket = db.relationship(Bucket, backref='objects')
     """Relationship to buckets."""
 
     file = db.relationship(FileInstance, backref='objects')
     """Relationship to file instance."""
+
+    is_show = db.Column(db.Boolean(name='is_show'),
+                        nullable=False,
+                        default=False)
+
+    is_thumbnail = db.Column(db.Boolean(name='is_thumbnail'),
+                             nullable=False,
+                             default=False)
+    """Defines if object is the thumbnail."""
 
     __table_args__ = (
         db.UniqueConstraint('bucket_id', 'version_id', 'key'),
@@ -968,6 +1117,7 @@ class ObjectVersion(db.Model, Timestamp):
     @hybrid_property
     def mimetype(self):
         """Get MIME type of object."""
+        from .utils import guess_mimetype
         return self._mimetype if self._mimetype else guess_mimetype(self.key)
 
     @mimetype.setter
@@ -988,7 +1138,8 @@ class ObjectVersion(db.Model, Timestamp):
     @ensure_no_file()
     @update_bucket_size
     def set_contents(self, stream, chunk_size=None, size=None, size_limit=None,
-                     progress_callback=None):
+                     replace_version_id=None, root_file_id=None,
+                     progress_callback=None, is_set_size_location=True):
         """Save contents of stream to file instance.
 
         If a file instance has already been set, this methods raises an
@@ -998,6 +1149,10 @@ class ObjectVersion(db.Model, Timestamp):
         :param size: Size of stream if known.
         :param chunk_size: Desired chunk size to read stream in. It is up to
             the storage interface if it respects this value.
+        :param replace_version_id: The ObjectVersion ID
+            of the previous version of the file.
+        :param root_file_id: The FileInstance ID
+            of the first version of the file.
         """
         if size_limit is None:
             size_limit = self.bucket.size_limit
@@ -1008,7 +1163,16 @@ class ObjectVersion(db.Model, Timestamp):
             progress_callback=progress_callback,
             default_location=self.bucket.location.uri,
             default_storage_class=self.bucket.default_storage_class,
+            is_set_size_location=is_set_size_location
         )
+
+        if root_file_id:
+            self.root_file_id = root_file_id
+        else:
+            replace_version = ObjectVersion.get(version_id=replace_version_id) \
+                if replace_version_id else None
+            self.root_file_id = replace_version.root_file_id \
+                if replace_version else self.file.id
 
         return self
 
@@ -1041,13 +1205,15 @@ class ObjectVersion(db.Model, Timestamp):
         self.file = fileinstance
         return self
 
-    def send_file(self, restricted=True, trusted=False, **kwargs):
+    def send_file(self, restricted=True, trusted=False,
+                  convert_to_pdf=False, **kwargs):
         """Wrap around FileInstance's send file."""
         return self.file.send_file(
             self.basename,
             restricted=restricted,
             mimetype=self.mimetype,
             trusted=trusted,
+            convert_to_pdf=convert_to_pdf,
             **kwargs
         )
 
@@ -1062,7 +1228,7 @@ class ObjectVersion(db.Model, Timestamp):
 
     @ensure_not_deleted(
         msg=[ObjectVersionError('Cannot copy a delete marker.')])
-    def copy(self, bucket=None, key=None):
+    def copy(self, bucket=None, key=None, is_thumbnail=False):
         """Copy an object version to a given bucket + object key.
 
         The copy operation is handled completely at the metadata level. The
@@ -1081,12 +1247,16 @@ class ObjectVersion(db.Model, Timestamp):
             Default: current bucket.
         :param key: Key name of destination object.
             Default: current object key.
+        :param is_thumbnail: for thumbnail.
+            Default: False.
         :returns: The copied object version.
         """
         new_ob = ObjectVersion.create(
             self.bucket if bucket is None else as_bucket(bucket),
             key or self.key,
-            _file_id=self.file_id
+            _file_id=self.file_id,
+            root_file_id=self.root_file_id,
+            is_thumbnail=is_thumbnail
         )
 
         for tag in self.tags:
@@ -1123,8 +1293,8 @@ class ObjectVersion(db.Model, Timestamp):
         return self
 
     @classmethod
-    def create(cls, bucket, key, _file_id=None, stream=None, mimetype=None,
-               version_id=None, **kwargs):
+    def create(cls, bucket, key, _file_id=None, root_file_id=None, stream=None,
+               mimetype=None, version_id=None, is_thumbnail=False, **kwargs):
         """Create a new object in a bucket.
 
         The created object is by default created as a delete marker. You must
@@ -1133,9 +1303,12 @@ class ObjectVersion(db.Model, Timestamp):
         :param bucket: The bucket (instance or id) to create the object in.
         :param key: Key of object.
         :param _file_id: For internal use.
+        :param root_file_id: The FileInstance ID
+            of the first version of the file.
         :param stream: File-like stream object. Used to set content of object
             immediately after being created.
         :param mimetype: MIME type of the file object if it is known.
+        :param is_thumbnail: for thumbnail.
         :param kwargs: Keyword arguments passed to ``Object.set_contents()``.
         """
         bucket = as_bucket(bucket)
@@ -1147,7 +1320,14 @@ class ObjectVersion(db.Model, Timestamp):
             latest_obj = cls.query.filter(
                 cls.bucket == bucket, cls.key == key, cls.is_head.is_(True)
             ).one_or_none()
+
+            login_user_id = 0
+            if current_user and current_user.is_authenticated:
+                login_user_id = current_user.get_id()
+
             if latest_obj is not None:
+                # set updated user id.
+                latest_obj.updated_user_id = login_user_id
                 latest_obj.is_head = False
                 db.session.add(latest_obj)
 
@@ -1159,18 +1339,23 @@ class ObjectVersion(db.Model, Timestamp):
                 version_id=version_id or uuid.uuid4(),
                 is_head=True,
                 mimetype=mimetype,
+                created_user_id=login_user_id,
+                updated_user_id=login_user_id,
+                is_show=False,
+                is_thumbnail=is_thumbnail,
             )
             if _file_id:
                 file_ = _file_id if isinstance(_file_id, FileInstance) else \
                     FileInstance.get(_file_id)
                 obj.set_file(file_)
+                obj.root_file_id = root_file_id or file_.id
             db.session.add(obj)
         if stream:
             obj.set_contents(stream, **kwargs)
         return obj
 
     @classmethod
-    def get(cls, bucket, key, version_id=None):
+    def get(cls, bucket=None, key=None, version_id=None):
         """Fetch a specific object.
 
         By default the latest object version is returned, if
@@ -1180,11 +1365,12 @@ class ObjectVersion(db.Model, Timestamp):
         :param key: Key of object.
         :param version_id: Specific version of an object.
         """
-        filters = [
-            cls.bucket_id == as_bucket_id(bucket),
-            cls.key == key,
-        ]
+        filters = []
 
+        if bucket:
+            filters.append(cls.bucket_id == as_bucket_id(bucket))
+        if key:
+            filters.append(cls.key == key)
         if version_id:
             filters.append(cls.version_id == version_id)
         else:
@@ -1230,12 +1416,14 @@ class ObjectVersion(db.Model, Timestamp):
         return None
 
     @classmethod
-    def get_by_bucket(cls, bucket, versions=False, with_deleted=False):
+    def get_by_bucket(cls, bucket, versions=False, with_deleted=False,
+                      asc_sort=False):
         """Return query that fetches all the objects in a bucket.
 
         :param bucket: The bucket (instance or id) to query.
         :param versions: Select all versions if True, only heads otherwise.
         :param with_deleted: Select also deleted objects if True.
+        :param asc_sort: whether prioritize acs sorting or not.
         :returns: The query to retrieve filtered objects in the given bucket.
         """
         bucket_id = bucket.id if isinstance(bucket, Bucket) else bucket
@@ -1250,7 +1438,13 @@ class ObjectVersion(db.Model, Timestamp):
         if not with_deleted:
             filters.append(cls.file_id.isnot(None))
 
-        return cls.query.filter(*filters).order_by(cls.key, cls.created.desc())
+        query = cls.query.filter(*filters)
+
+        if asc_sort:
+            query = query.order_by(cls.created.asc(), cls.key)
+        else:
+            query = query.order_by(cls.key, cls.created.desc())
+        return query
 
     @classmethod
     def relink_all(cls, old_file, new_file):
@@ -1260,6 +1454,7 @@ class ObjectVersion(db.Model, Timestamp):
 
            Use this method with great care.
         """
+        new_file.checksum = old_file.checksum
         assert old_file.checksum == new_file.checksum
         assert old_file.id
         assert new_file.id
@@ -1267,6 +1462,20 @@ class ObjectVersion(db.Model, Timestamp):
         with db.session.begin_nested():
             ObjectVersion.query.filter_by(file_id=str(old_file.id)).update({
                 ObjectVersion.file_id: str(new_file.id)})
+
+    @classmethod
+    def num_version_link_to_files(cls, file_ids):
+        """Count the number of versions that link to files with file_id.
+
+        :param file_ids: Specific list of file id.
+        """
+        if file_ids:
+            return db.session.query(cls.file_id, func.count(cls.version_id)) \
+                .filter(cls.file_id.in_(file_ids)) \
+                .group_by(cls.file_id) \
+                .all()
+
+        return []
 
     def get_tags(self):
         """Get tags for object version as dictionary."""

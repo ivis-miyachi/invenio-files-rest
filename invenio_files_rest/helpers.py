@@ -208,7 +208,8 @@ def make_path(base_uri, path, filename, path_dimensions, split_length):
     uri_parts.append(path)
     uri_parts.append(filename)
 
-    return os.path.join(base_uri, *uri_parts)
+    url = os.path.join(base_uri, *uri_parts)
+    return url.replace("\\", "/") if os.sys.platform == 'win32' else url
 
 
 def compute_md5_checksum(stream, **kwargs):
@@ -235,7 +236,7 @@ def compute_checksum(stream, algo, message_digest, chunk_size=None,
     chunk_size = chunk_size_or_default(chunk_size)
 
     bytes_read = 0
-    while 1:
+    while True:
         chunk = stream.read(chunk_size)
         if not chunk:
             if progress_callback:
@@ -272,7 +273,7 @@ def populate_from_path(bucket, source, checksum=True, key_prefix='',
 
         if checksum:
             file_checksum = compute_md5_checksum(
-                    open(path, 'rb'), chunk_size=chunk_size)
+                open(path, 'rb'), chunk_size=chunk_size)
             file_instance = FileInstance.query.filter_by(
                 checksum=file_checksum, size=os.path.getsize(path)
             ).first()
